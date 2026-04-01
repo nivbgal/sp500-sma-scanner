@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-S&P 500 — Multi-SMA Scanner
-Finds all S&P 500 stocks whose current price is within 1% of their 20, 150, or 200-day SMA.
+S&P 500 — 200-Day SMA Scanner
+Finds all S&P 500 stocks whose current price is within 1% of their 200-day SMA.
 
 Data sources (all free, no API keys):
   - Wikipedia: S&P 500 ticker list
-  - Yahoo Finance (via yfinance):
-      - 200-day & 50-day SMA: pre-calculated (from quote data)
-      - 20-day & 150-day SMA: calculated from batch-downloaded history
+  - Yahoo Finance (via yfinance): pre-calculated 200-day SMA + current price
 
 Notification:
-  - Telegram bot (via TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars)
+  - Telegram bot (optional, via TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID env vars)
 """
 
 import os
@@ -24,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 THRESHOLD_PCT = 1.0
 MAX_WORKERS = 20
-SMA_WINDOWS = [20, 150, 200]
 
 
 # ── 1. Get S&P 500 tickers from Wikipedia ─────────────────────────────────
@@ -40,9 +37,8 @@ def get_sp500_tickers():
     return sorted(tickers)
 
 
-# ── 2. Fetch 200-day SMA from Yahoo quote data ───────────────────────────
-def fetch_quote_data(symbol):
-    """Get current price + pre-calculated 200-day SMA from Yahoo quote."""
+# ── 2. Fetch pre-calculated 200-day SMA from Yahoo Finance ───────────────
+def fetch_sma_data(symbol):
     try:
         t = yf.Ticker(symbol)
         info = t.info
@@ -52,112 +48,40 @@ def fetch_quote_data(symbol):
             or info.get("previousClose")
         )
         sma_200 = info.get("twoHundredDayAverage")
-        if price is None:
-            return (symbol, None, None, "Missing price")
-        return (symbol, float(price), float(sma_200) if sma_200 else None, None)
+        if price is None or sma_200 is None or sma_200 == 0:
+            return (symbol, None, None, None, "Missing price or SMA data")
+        pct = ((price - sma_200) / sma_200) * 100
+        return (symbol, float(price), float(sma_200), float(pct), None)
     except Exception as e:
-        return (symbol, None, None, str(e))
+        return (symbol, None, None, None, str(e))
 
 
-# ── 3. Batch download history for 20-day & 150-day SMA ───────────────────
-def compute_sma_from_history(tickers):
-    """
-    Download ~200 days of history for all tickers in one batch call,
-    then compute 20-day and 150-day SMAs.
-    Returns dict: {ticker: {20: sma_val, 150: sma_val}}
-    """
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=300)  # enough buffer for 150 trading days
-
-    print("Batch downloading price history for 20 & 150-day SMA …")
-    data = yf.download(
-        tickers=tickers,
-        start=start.isoformat(),
-        end=end.isoformat(),
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-
-    sma_dict = {}
-    for ticker in tickers:
-        try:
-            if len(tickers) == 1:
-                close = data["Close"].dropna()
-            else:
-                close = data[(ticker, "Close")].dropna()
-
-            sma_dict[ticker] = {}
-            for window in [20, 150]:
-                if len(close) >= window:
-                    sma_dict[ticker][window] = float(close.rolling(window=window).mean().iloc[-1])
-                else:
-                    sma_dict[ticker][window] = None
-        except Exception:
-            sma_dict[ticker] = {20: None, 150: None}
-
-    return sma_dict
-
-
-# ── 4. Main scan ──────────────────────────────────────────────────────────
 def scan_all(tickers):
-    # Step A: Get current prices + 200-day SMA from quote data (concurrent)
-    print(f"Fetching quotes for {len(tickers)} tickers …\n")
-    quote_results = {}
+    results = []
     errors = []
-
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_quote_data, sym): sym for sym in tickers}
+        futures = {executor.submit(fetch_sma_data, sym): sym for sym in tickers}
         done = 0
         total = len(futures)
         for future in as_completed(futures):
             done += 1
             if done % 50 == 0 or done == total:
-                print(f"  Quotes: {done}/{total}")
-            sym, price, sma_200, err = future.result()
+                print(f"  Progress: {done}/{total}")
+            sym, price, sma, pct, err = future.result()
             if err:
                 errors.append((sym, err))
             else:
-                quote_results[sym] = {"price": price, 200: sma_200}
-
-    # Step B: Batch download history for 20 & 150-day SMA
-    valid_tickers = list(quote_results.keys())
-    sma_dict = compute_sma_from_history(valid_tickers)
-
-    # Step C: Merge and find stocks near any SMA
-    results = []
-    for sym, quote in quote_results.items():
-        price = quote["price"]
-        if price is None:
-            continue
-
-        sma_values = {
-            20: sma_dict.get(sym, {}).get(20),
-            150: sma_dict.get(sym, {}).get(150),
-            200: quote.get(200),
-        }
-
-        for window in SMA_WINDOWS:
-            sma = sma_values.get(window)
-            if sma is None or sma == 0:
-                continue
-            pct = ((price - sma) / sma) * 100
-            if abs(pct) <= THRESHOLD_PCT:
                 results.append({
                     "Ticker": sym,
-                    "SMA": f"{window}d",
                     "Close": round(price, 2),
-                    f"SMA Value": round(sma, 2),
+                    "200-SMA": round(sma, 2),
                     "% from SMA": round(pct, 2),
                     "Direction": "Above" if pct >= 0 else "Below",
                 })
-
     return results, errors
 
 
-# ── 5. Telegram notification ──────────────────────────────────────────────
+# ── 3. Telegram notification ──────────────────────────────────────────────
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -178,7 +102,7 @@ def send_telegram(message):
         return False
 
 
-# ── 6. Format & run ──────────────────────────────────────────────────────
+# ── 4. Format & run ──────────────────────────────────────────────────────
 def main():
     now = datetime.datetime.now(datetime.timezone.utc)
     et_offset = datetime.timezone(datetime.timedelta(hours=-4))
@@ -186,65 +110,53 @@ def main():
     date_str = now_et.strftime("%Y-%m-%d %H:%M ET")
 
     print("=" * 60)
-    print("  S&P 500 — Stocks Within 1% of 20/150/200-Day SMA")
+    print("  S&P 500 — Stocks Within 1% of 200-Day SMA")
     print(f"  Run: {date_str}")
     print("=" * 60)
     print()
 
     tickers = get_sp500_tickers()
     print(f"Loaded {len(tickers)} S&P 500 tickers from Wikipedia.\n")
+    print("Fetching pre-calculated 200-day SMA from Yahoo Finance …\n")
 
     results, errors = scan_all(tickers)
+    near_sma = [r for r in results if abs(r["% from SMA"]) <= THRESHOLD_PCT]
 
-    # Sort by SMA window, then by absolute distance
-    if results:
-        df = pd.DataFrame(results)
-        df["abs_pct"] = df["% from SMA"].abs()
-        df = df.sort_values(["SMA", "abs_pct"]).drop(columns=["abs_pct"])
-
-        print(f"\nFound {len(df)} hits across 20/150/200-day SMAs:\n")
-        print(df.to_string(index=False))
+    # ── Console output ──
+    if not near_sma:
+        print("No S&P 500 stocks are currently within 1% of their 200-day SMA.")
     else:
-        print("No stocks within 1% of any SMA today.")
+        df = pd.DataFrame(near_sma).sort_values("% from SMA", key=abs)
+        print(f"Found {len(df)} stocks within 1% of their 200-day SMA:\n")
+        print(df.to_string(index=False))
 
     print(f"\n({len(errors)} tickers had data issues and were skipped)")
 
     # ── Build Telegram message ──
-    lines = [
-        f"<b>S&P 500 — Stocks Near Key SMAs</b>",
-        f"📅 {date_str}",
-        "",
-    ]
+    lines = [f"<b>S&P 500 — Stocks Near 200-Day SMA</b>", f"📅 {date_str}", ""]
 
-    if not results:
-        lines.append("No stocks within 1% of their 20/150/200-day SMA today.")
+    if not near_sma:
+        lines.append("No stocks within 1% of their 200-day SMA today.")
     else:
-        df = pd.DataFrame(results)
-        df["abs_pct"] = df["% from SMA"].abs()
-
-        for window in SMA_WINDOWS:
-            group = df[df["SMA"] == f"{window}d"].sort_values("abs_pct")
-            if group.empty:
-                continue
-            lines.append(f"<b>━━ {window}-Day SMA ({len(group)} stocks) ━━</b>")
-            lines.append("")
-            for _, row in group.iterrows():
-                arrow = "🟢" if row["Direction"] == "Above" else "🔴"
-                lines.append(
-                    f"{arrow} <b>{row['Ticker']}</b>  "
-                    f"${row['Close']:.2f}  →  "
-                    f"SMA ${row['SMA Value']:.2f}  "
-                    f"({row['% from SMA']:+.2f}%)"
-                )
-            lines.append("")
+        df = pd.DataFrame(near_sma).sort_values("% from SMA", key=abs)
+        lines.append(f"<b>{len(df)} stocks within 1%:</b>")
+        lines.append("")
+        for _, row in df.iterrows():
+            arrow = "🟢" if row["Direction"] == "Above" else "🔴"
+            lines.append(
+                f"{arrow} <b>{row['Ticker']}</b>  "
+                f"${row['Close']:.2f}  →  "
+                f"SMA ${row['200-SMA']:.2f}  "
+                f"({row['% from SMA']:+.2f}%)"
+            )
 
     if errors:
-        lines.append(f"({len(errors)} tickers skipped)")
+        lines.append(f"\n({len(errors)} tickers skipped)")
 
     message = "\n".join(lines)
     send_telegram(message)
 
-    return 0
+    return 0 if not errors else 1
 
 
 if __name__ == "__main__":
